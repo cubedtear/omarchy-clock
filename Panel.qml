@@ -94,6 +94,70 @@ Panel {
   // rather than lazily like the searchable timezone list above).
   property var countryCodes: ({})
 
+  // ---- Home row + scrubber (angelv.clock-inspired). homeTz is the
+  //      machine's own zone, detected once via `timedatectl` -- pinned as
+  //      the first, non-removable row so every other zone has a fixed
+  //      reference point to compare against.
+  property string homeTz: ""
+  // null while not dragging (rows show live time); 0..1 (fraction of the
+  // home row's day) while the scrubber is held, snapped to 15-minute marks.
+  property var scrubFraction: null
+  readonly property bool scrubbing: scrubFraction !== null
+
+  // Home row + configured zones, each enriched with live (or scrubbed)
+  // time/day-offset and sorted west-to-east by UTC offset. Built fresh on
+  // every dependency change rather than cached -- the underlying arrays are
+  // always small (a handful of cities).
+  readonly property var zoneRows: {
+    var rows = []
+    if (root.homeTz !== "") {
+      var homeEntry = root.worldClockTimes[root.homeTz]
+      rows.push({
+        tz: root.homeTz,
+        label: "Home",
+        isHome: true,
+        offsetMinutes: homeEntry ? homeEntry.offsetMinutes : null,
+        liveTime: homeEntry ? homeEntry.time : "—",
+        liveDateKey: homeEntry ? homeEntry.dateKey : ""
+      })
+    }
+    for (var i = 0; i < root.worldClocks.length; i++) {
+      var wc = root.worldClocks[i]
+      var entry = root.worldClockTimes[wc.tz]
+      rows.push({
+        tz: wc.tz,
+        label: Model.worldClockShortLabel(wc, root.countryCodes),
+        isHome: false,
+        offsetMinutes: entry ? entry.offsetMinutes : null,
+        liveTime: entry ? entry.time : "—",
+        liveDateKey: entry ? entry.dateKey : ""
+      })
+    }
+    var sorted = Model.sortZoneRows(rows)
+    var referenceOffset = null
+    for (var k = 0; k < sorted.length; k++) {
+      if (sorted[k].isHome) { referenceOffset = sorted[k].offsetMinutes; break }
+    }
+    if (referenceOffset === null && sorted.length > 0) referenceOffset = sorted[0].offsetMinutes
+
+    for (var j = 0; j < sorted.length; j++) {
+      var row = sorted[j]
+      if (root.scrubbing) {
+        var scrubbed = Model.scrubbedClock(root.scrubFraction, referenceOffset, row.offsetMinutes)
+        row.time = scrubbed.time
+        row.dayOffset = scrubbed.dayOffset
+      } else {
+        row.time = row.liveTime
+        row.dayOffset = Model.worldClockDayOffset(root.todayKey, row.liveDateKey)
+      }
+      row.period = Model.dayPeriod(row.time)
+      row.fraction = Model.dayFraction(row.time)
+    }
+    return sorted
+  }
+
+  readonly property var todayMoonPhase: Model.moonPhase(root.today.getFullYear(), root.today.getMonth(), root.today.getDate())
+
   // Guarded so the widget renders before the bar is injected (the bar-widget
   // contract instantiates it bare).
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
@@ -243,20 +307,37 @@ Panel {
     persistSettings({ showSeconds: !!value })
   }
 
-  function removeWorldClock(index) {
+  // By tz rather than position: zoneRows is sorted by UTC offset, so its
+  // index into that list is not the same as the index in the unsorted
+  // settings array this actually needs to splice.
+  function removeWorldClock(tz) {
     var list = root.worldClocks.slice()
-    if (index < 0 || index >= list.length) return
-    list.splice(index, 1)
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].tz === tz) { list.splice(i, 1); break }
+    }
     persistSettings({ worldClocks: list })
     root.refreshWorldClockTimes()
   }
 
   function refreshWorldClockTimes() {
-    if (root.worldClocks.length === 0) { root.worldClockTimes = {}; return }
     var zones = []
+    if (root.homeTz !== "") zones.push(root.homeTz)
     for (var i = 0; i < root.worldClocks.length; i++) zones.push(root.worldClocks[i].tz)
+    if (zones.length === 0) { root.worldClockTimes = {}; return }
     worldClockTimesProc.command = Model.worldClockCommand(zones)
     worldClockTimesProc.running = true
+  }
+
+  function startScrub(fraction) {
+    root.scrubFraction = Model.snapToQuarterHour(fraction)
+  }
+
+  function updateScrub(fraction) {
+    root.scrubFraction = Model.snapToQuarterHour(fraction)
+  }
+
+  function endScrub() {
+    root.scrubFraction = null
   }
 
   function startAddingWorldClock() {
@@ -355,9 +436,27 @@ Panel {
     }
   }
 
+  // Same detection omarchy-menu-timezone's "current" state relies on.
+  // One-shot: the machine's zone doesn't change under a running session.
+  Process {
+    id: homeTzProc
+    command: ["timedatectl", "show", "--property=Timezone", "--value"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var tz = String(text || "").replace(/^\s+|\s+$/g, "")
+        if (tz !== "") {
+          root.homeTz = tz
+          root.refreshWorldClockTimes()
+        }
+      }
+    }
+  }
+
   Component.onCompleted: {
     root.refreshWorldClockTimes()
     countryCodeProc.running = true
+    homeTzProc.running = true
   }
 
   KeyboardPanel {
@@ -447,6 +546,31 @@ Panel {
                 font.family: root.contentFontFamily
                 font.pixelSize: 52
                 font.bold: true
+              }
+
+              // Small, unobtrusive -- today's moon phase, not a whole
+              // section. A pure-math approximation (Model.moonPhase), not
+              // an API call.
+              Text {
+                id: moonGlyph
+                textFormat: Text.PlainText
+                anchors.baseline: heroDate.baseline
+                text: root.todayMoonPhase.glyph
+                font.pixelSize: 22
+
+                MouseArea {
+                  id: moonMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  acceptedButtons: Qt.NoButton
+
+                  PanelToolTip {
+                    visible: moonMouse.containsMouse
+                    text: root.todayMoonPhase.name
+                    fontFamily: root.contentFontFamily
+                  }
+                }
               }
             }
 
@@ -907,37 +1031,76 @@ Panel {
               }
 
               Repeater {
-                model: root.worldClocks
+                model: root.zoneRows
 
                 Item {
+                  id: zoneRow
                   required property var modelData
-                  required property int index
                   width: worldClocksColumn.width
-                  height: Style.space(28)
-
-                  readonly property var entry: root.worldClockTimes[modelData.tz]
-                  readonly property string timeText: entry ? entry.time : "—"
-                  readonly property int dayOffset: entry ? Model.worldClockDayOffset(root.todayKey, entry.dateKey) : 0
+                  height: Style.space(34)
 
                   Text {
+                    id: periodGlyph
                     textFormat: Text.PlainText
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    text: parent.modelData.label
+                    text: zoneRow.modelData.period === "day" ? "☀" : "☾"
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    id: rowLabel
+                    textFormat: Text.PlainText
+                    anchors.left: periodGlyph.right
+                    anchors.leftMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: zoneRow.modelData.label
                     color: root.contentForeground
                     font.family: root.contentFontFamily
                     font.pixelSize: Style.font.body
+                    font.bold: zoneRow.modelData.isHome
                     elide: Text.ElideRight
-                    width: parent.width - timeLabel.width - removeButton.width - Style.space(16)
+                    width: Style.space(70)
+                  }
+
+                  // Compact 24h night/day rail with a marker at this row's
+                  // current (or scrubbed) position -- the same instant every
+                  // row is showing, just each at its own point in the cycle.
+                  Rectangle {
+                    id: rail
+                    anchors.left: rowLabel.right
+                    anchors.leftMargin: Style.space(8)
+                    anchors.right: timeLabel.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Style.space(6)
+                    radius: height / 2
+                    gradient: Gradient {
+                      orientation: Gradient.Horizontal
+                      GradientStop { position: 0.0; color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.08) }
+                      GradientStop { position: 0.25; color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.28) }
+                      GradientStop { position: 0.5; color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.28) }
+                      GradientStop { position: 0.75; color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.08) }
+                      GradientStop { position: 1.0; color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.08) }
+                    }
+
+                    Rectangle {
+                      width: Style.space(8)
+                      height: Style.space(8)
+                      radius: width / 2
+                      color: Style.selectedStateColor(root.contentForeground, Color.accent)
+                      anchors.verticalCenter: parent.verticalCenter
+                      x: Math.round(rail.width * zoneRow.modelData.fraction - width / 2)
+                    }
                   }
 
                   Text {
                     id: timeLabel
                     textFormat: Text.PlainText
-                    anchors.right: removeButton.left
-                    anchors.rightMargin: Style.space(8)
+                    anchors.right: zoneRow.modelData.isHome ? parent.right : removeButton.left
+                    anchors.rightMargin: zoneRow.modelData.isHome ? 0 : Style.space(8)
                     anchors.verticalCenter: parent.verticalCenter
-                    text: parent.timeText + (parent.dayOffset !== 0 ? (parent.dayOffset < 0 ? " (yst)" : " (tmrw)") : "")
+                    text: zoneRow.modelData.time + (zoneRow.modelData.dayOffset !== 0 ? (zoneRow.modelData.dayOffset < 0 ? " (yst)" : " (tmrw)") : "")
                     color: Qt.darker(root.contentForeground, 1.3)
                     font.family: root.contentFontFamily
                     font.pixelSize: Style.font.body
@@ -945,6 +1108,7 @@ Panel {
 
                   PanelActionButton {
                     id: removeButton
+                    visible: !zoneRow.modelData.isHome
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     iconText: "󰅖"
@@ -953,8 +1117,56 @@ Panel {
                     hoverColor: root.bar ? root.bar.urgent : Color.urgent
                     fontFamily: root.contentFontFamily
                     fontSize: Style.font.caption
-                    onClicked: root.removeWorldClock(parent.index)
+                    onClicked: root.removeWorldClock(parent.modelData.tz)
                   }
+                }
+              }
+
+              // ---- Scrubber: drag anywhere along the rail to preview every
+              //      row above at that same hour at once, snapped to 15-
+              //      minute marks ("magnetic"). Only shown once there is a
+              //      home row plus at least one other zone to compare it
+              //      against.
+              Item {
+                visible: root.homeTz !== "" && root.worldClocks.length > 0
+                width: worldClocksColumn.width
+                height: visible ? Style.space(26) : 0
+
+                Rectangle {
+                  id: scrubTrack
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: Style.space(4)
+                  radius: height / 2
+                  color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.15)
+
+                  Rectangle {
+                    width: Style.space(10)
+                    height: Style.space(10)
+                    radius: width / 2
+                    color: root.scrubbing ? Style.selectedStateColor(root.contentForeground, Color.accent) : Qt.darker(root.contentForeground, 1.3)
+                    anchors.verticalCenter: parent.verticalCenter
+                    // Home's own live time when idle -- not zoneRows[0],
+                    // which is the westmost row after sorting and is only
+                    // home when home happens to be the westmost zone.
+                    x: Math.round(parent.width * (root.scrubbing ? root.scrubFraction : Model.dayFraction(root.worldClockTimes[root.homeTz] ? root.worldClockTimes[root.homeTz].time : "")) - width / 2)
+                  }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onPressed: function(mouse) { root.startScrub(mouse.x / width) }
+                  onPositionChanged: function(mouse) { if (pressed) root.updateScrub(mouse.x / width) }
+                  onReleased: root.endScrub()
+                  onCanceled: root.endScrub()
+                }
+
+                PanelToolTip {
+                  visible: root.scrubbing
+                  text: "Drag to preview other hours"
+                  fontFamily: root.contentFontFamily
                 }
               }
 

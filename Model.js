@@ -297,15 +297,18 @@ function withSeconds(format, enabled) {
 // Builds the argv for a single batched `date` call covering every
 // configured zone at once (one subprocess per tick, not one per row).
 // Zone names travel as real argv entries, never interpolated into a shell
-// string, so there is nothing to escape.
+// string, so there is nothing to escape. `%z` (numeric UTC offset, e.g.
+// "+0900") rides along so rows can be sorted west-to-east and the scrubber
+// can compute other zones' hypothetical time without another subprocess.
 function worldClockCommand(zones) {
-  var script = 'for tz in "$@"; do printf "%s\\t" "$tz"; TZ="$tz" date "+%H:%M|%Y-%m-%d"; done'
+  var script = 'for tz in "$@"; do printf "%s\\t" "$tz"; TZ="$tz" date "+%H:%M|%Y-%m-%d|%z"; done'
   return ["bash", "-c", script, "_"].concat(zones)
 }
 
-// Parses that command's stdout ("tz\tHH:MM|YYYY-MM-DD" per line) into
-// { [tz]: { time, dateKey } }. A line for a zone `date` couldn't resolve
-// (renamed/removed from tzdata since it was saved) is skipped, not fatal.
+// Parses that command's stdout ("tz\tHH:MM|YYYY-MM-DD|+HHMM" per line) into
+// { [tz]: { time, dateKey, offsetMinutes } }. A line for a zone `date`
+// couldn't resolve (renamed/removed from tzdata since it was saved) is
+// skipped, not fatal.
 function parseWorldClockOutput(text) {
   var lines = String(text || "").split("\n")
   var out = {}
@@ -316,8 +319,8 @@ function parseWorldClockOutput(text) {
     if (tab === -1) continue
     var tz = line.slice(0, tab)
     var rest = line.slice(tab + 1).split("|")
-    if (rest.length !== 2) continue
-    out[tz] = { time: rest[0], dateKey: rest[1] }
+    if (rest.length !== 3) continue
+    out[tz] = { time: rest[0], dateKey: rest[1], offsetMinutes: parseUtcOffsetMinutes(rest[2]) }
   }
   return out
 }
@@ -327,6 +330,111 @@ function parseWorldClockOutput(text) {
 function worldClockDayOffset(hereKey, thereKey) {
   if (!thereKey || thereKey === hereKey) return 0
   return thereKey < hereKey ? -1 : 1
+}
+
+// ---- Home row + offset-aware sorting/scrubbing (angelv.clock-inspired).
+
+// "+0930" / "-0500" -> signed minutes from UTC. Null on anything that
+// doesn't parse, so a bad reading sorts last instead of breaking the
+// comparison.
+function parseUtcOffsetMinutes(raw) {
+  var text = String(raw || "").replace(/^\s+|\s+$/g, "")
+  var m = /^([+-])(\d{2})(\d{2})$/.exec(text)
+  if (!m) return null
+  var sign = m[1] === "-" ? -1 : 1
+  return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10))
+}
+
+// Ascending by UTC offset -- west (most negative) to east (most positive).
+// Rows with no resolvable offset sort after every row that has one.
+function sortZoneRows(rows) {
+  var withOffset = []
+  var withoutOffset = []
+  for (var i = 0; i < rows.length; i++) {
+    var v = rows[i].offsetMinutes
+    if (v === null || v === undefined) withoutOffset.push(rows[i])
+    else withOffset.push(rows[i])
+  }
+  withOffset.sort(function(a, b) { return a.offsetMinutes - b.offsetMinutes })
+  return withOffset.concat(withoutOffset)
+}
+
+// "day" for a hand-wavy 6am-6pm window, "night" otherwise -- a glance-level
+// indicator, not a sunrise/sunset calculation.
+function dayPeriod(hhmm) {
+  var hour = parseInt(String(hhmm || "").split(":")[0], 10)
+  if (!isFinite(hour)) return "day"
+  return (hour >= 6 && hour < 18) ? "day" : "night"
+}
+
+// Fraction (0..1) of the 24h rail a "HH:MM" string falls at.
+function dayFraction(hhmm) {
+  var parts = String(hhmm || "").split(":")
+  var hour = parseInt(parts[0], 10)
+  var minute = parseInt(parts[1], 10)
+  if (!isFinite(hour)) return 0
+  if (!isFinite(minute)) minute = 0
+  return (((hour * 60 + minute) % 1440) + 1440) % 1440 / 1440
+}
+
+// The scrubber's position is a fraction of the day in the *reference*
+// row's (home's) local time. Every other row's hypothetical time at that
+// same instant is just its own UTC offset away from the reference's --
+// pure arithmetic, no subprocess call needed while dragging.
+function scrubbedClock(scrubFraction, referenceOffsetMinutes, rowOffsetMinutes) {
+  var refMinutes = Math.round((((scrubFraction % 1) + 1) % 1) * 1440)
+  var delta = (rowOffsetMinutes === null || rowOffsetMinutes === undefined
+    || referenceOffsetMinutes === null || referenceOffsetMinutes === undefined)
+    ? 0
+    : rowOffsetMinutes - referenceOffsetMinutes
+  var total = refMinutes + delta
+  var dayOffset = Math.floor(total / 1440)
+  var normalized = ((total % 1440) + 1440) % 1440
+  return {
+    time: pad2(Math.floor(normalized / 60)) + ":" + pad2(normalized % 60),
+    dayOffset: dayOffset
+  }
+}
+
+// Snaps a raw 0..1 drag fraction to the nearest 15-minute mark -- the
+// "magnetic" part; dragging lands on :00/:15/:30/:45, not an arbitrary
+// minute.
+function snapToQuarterHour(fraction) {
+  var minutes = Math.round((((fraction % 1) + 1) % 1) * 1440 / 15) * 15
+  return (minutes % 1440) / 1440
+}
+
+// ---- Moon phase. A pure synodic-month approximation (no ephemeris/network
+//      dependency), accurate to roughly a day -- the right precision for a
+//      small panel decoration, not an almanac.
+var MOON_PHASES = [
+  { name: "New Moon", glyph: "🌑" },
+  { name: "Waxing Crescent", glyph: "🌒" },
+  { name: "First Quarter", glyph: "🌓" },
+  { name: "Waxing Gibbous", glyph: "🌔" },
+  { name: "Full Moon", glyph: "🌕" },
+  { name: "Waning Gibbous", glyph: "🌖" },
+  { name: "Last Quarter", glyph: "🌗" },
+  { name: "Waning Crescent", glyph: "🌘" }
+]
+var SYNODIC_MONTH_DAYS = 29.530588853
+var KNOWN_NEW_MOON_JULIAN_DAY = 2451550.1 // 2000-01-06 18:14 UTC
+
+function julianDayNumber(year, month, day) {
+  var a = Math.floor((14 - month) / 12)
+  var y = year + 4800 - a
+  var m = month + 12 * a - 3
+  return day + Math.floor((153 * m + 2) / 5) + 365 * y + Math.floor(y / 4) - Math.floor(y / 100) + Math.floor(y / 400) - 32045
+}
+
+// month is 0-indexed (JS Date convention), matching every other date
+// helper in this file.
+function moonPhase(year, month, day) {
+  var jd = julianDayNumber(year, month + 1, day)
+  var cycles = (jd - KNOWN_NEW_MOON_JULIAN_DAY) / SYNODIC_MONTH_DAYS
+  var fraction = cycles - Math.floor(cycles)
+  var index = Math.floor(fraction * 8 + 0.5) % 8
+  return { fraction: fraction, name: MOON_PHASES[index].name, glyph: MOON_PHASES[index].glyph }
 }
 
 // Maps an IANA zone name to its primary ISO 3166-1 country code, from
@@ -412,6 +520,13 @@ if (typeof module !== "undefined") {
     worldClockDayOffset: worldClockDayOffset,
     parseWorldClocks: parseWorldClocks,
     parseZoneCountryCodes: parseZoneCountryCodes,
-    worldClockShortLabel: worldClockShortLabel
+    worldClockShortLabel: worldClockShortLabel,
+    parseUtcOffsetMinutes: parseUtcOffsetMinutes,
+    sortZoneRows: sortZoneRows,
+    dayPeriod: dayPeriod,
+    dayFraction: dayFraction,
+    scrubbedClock: scrubbedClock,
+    snapToQuarterHour: snapToQuarterHour,
+    moonPhase: moonPhase
   }
 }
