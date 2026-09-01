@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -80,6 +81,11 @@ Panel {
   property date worldNow: new Date()
   property bool addingWorldClock: false
   property string worldClockError: ""
+  property string pendingWorldClockTz: ""
+  // Fetched once (lazily, on first "Add city") from `timedatectl
+  // list-timezones` -- the same source omarchy-menu-timezone reads from --
+  // and cached for the rest of the panel's life.
+  property var timezoneOptions: []
 
   // Guarded so the widget renders before the bar is injected (the bar-widget
   // contract instantiates it bare).
@@ -239,21 +245,22 @@ Panel {
   function startAddingWorldClock() {
     root.addingWorldClock = true
     root.worldClockError = ""
+    root.pendingWorldClockTz = ""
+    if (root.timezoneOptions.length === 0) timezoneListProc.running = true
     Qt.callLater(function() {
-      worldClockTzField.text = ""
       worldClockLabelField.text = ""
-      worldClockTzField.forceActiveFocus()
     })
   }
 
   function cancelAddingWorldClock() {
     root.addingWorldClock = false
     root.worldClockError = ""
+    root.pendingWorldClockTz = ""
   }
 
   function commitWorldClock() {
-    var tz = String(worldClockTzField.text || "").replace(/^\s+|\s+$/g, "")
-    if (tz === "") { root.worldClockError = "Enter a timezone, e.g. Asia/Tokyo"; return }
+    var tz = String(root.pendingWorldClockTz || "").replace(/^\s+|\s+$/g, "")
+    if (tz === "") { root.worldClockError = "Search and pick a city first"; return }
     if (!Model.isValidTimeZone(tz)) { root.worldClockError = "Unknown timezone: " + tz; return }
     var label = String(worldClockLabelField.text || "").replace(/^\s+|\s+$/g, "")
     var list = root.worldClocks.slice()
@@ -261,6 +268,7 @@ Panel {
     persistSettings({ worldClocks: list })
     root.addingWorldClock = false
     root.worldClockError = ""
+    root.pendingWorldClockTz = ""
   }
 
   // English short day names, matching the rest of the interface.
@@ -286,6 +294,26 @@ Panel {
     id: worldClockTicker
     precision: SystemClock.Minutes
     onDateChanged: root.worldNow = date
+  }
+
+  // Same source omarchy-menu-timezone reads from. Run once per panel
+  // lifetime (lazily, on first "Add city"), not on every open.
+  Process {
+    id: timezoneListProc
+    command: ["timedatectl", "list-timezones"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").split("\n")
+        var options = []
+        for (var i = 0; i < lines.length; i++) {
+          var tz = lines[i].replace(/^\s+|\s+$/g, "")
+          if (tz === "") continue
+          options.push({ value: tz, label: tz })
+        }
+        root.timezoneOptions = options
+      }
+    }
   }
 
   KeyboardPanel {
@@ -812,12 +840,11 @@ Panel {
           // ---- World clocks: a short, user-picked list of other cities,
           //      each showing that zone's current time via Intl (plain QML
           //      Date carries no timezone of its own). Secondary to the
-          //      grid above by design — the section stays collapsed to
-          //      nothing until someone adds a city.
+          //      grid above by design, but the header + "Add city" row must
+          //      always render — they're the only way to add the first one.
           Item {
-            visible: root.worldClocks.length > 0 || root.addingWorldClock
             width: parent.width
-            height: visible ? worldClocksColumn.implicitHeight : 0
+            height: worldClocksColumn.implicitHeight
 
             Column {
               id: worldClocksColumn
@@ -931,19 +958,23 @@ Panel {
                   width: parent.width
                   spacing: Style.space(6)
 
-                  TextField {
-                    id: worldClockTzField
+                  SearchableDropdown {
+                    id: worldClockTzDropdown
                     width: (parent.width - Style.space(6)) * 0.6
-                    placeholderText: "Timezone, e.g. Asia/Tokyo"
+                    showLabel: false
+                    placeholderText: "Search city or timezone..."
+                    emptyText: root.timezoneOptions.length === 0 ? "Loading…" : "No matches"
                     foreground: root.contentForeground
-                    verticalPadding: Style.space(4)
-                    Keys.onReturnPressed: root.commitWorldClock()
-                    Keys.onEscapePressed: root.cancelAddingWorldClock()
+                    accent: Color.accent
+                    fontFamily: root.contentFontFamily
+                    options: root.timezoneOptions
+                    value: root.pendingWorldClockTz
+                    onChanged: function(v) { root.pendingWorldClockTz = v }
                   }
 
                   TextField {
                     id: worldClockLabelField
-                    width: parent.width - worldClockTzField.width - Style.space(6)
+                    width: parent.width - worldClockTzDropdown.width - Style.space(6)
                     placeholderText: "Label (optional)"
                     foreground: root.contentForeground
                     verticalPadding: Style.space(4)
