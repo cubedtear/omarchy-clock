@@ -37,6 +37,25 @@ BarWidget {
   readonly property string displayText: formatted(displayDate)
   readonly property var verticalLines: displayText.split("\n")
 
+  // World clocks, shown as short "CODE HH:MM" segments after the local
+  // time. Reuses Panel.qml's already-ticking background computation
+  // (panelLoader keeps it alive whether the popup is open or not) rather
+  // than running a second copy of the same subprocess.
+  readonly property var worldClocks: Model.parseWorldClocks(setting("worldClocks", []))
+  readonly property var worldClockTimes: panelLoader.item ? panelLoader.item.worldClockTimes : ({})
+  readonly property var countryCodes: panelLoader.item ? panelLoader.item.countryCodes : ({})
+  readonly property string worldClockSegment: {
+    if (vertical || worldClocks.length === 0) return ""
+    var parts = []
+    for (var i = 0; i < worldClocks.length; i++) {
+      var wc = worldClocks[i]
+      var entry = worldClockTimes[wc.tz]
+      if (!entry) continue
+      parts.push(Model.worldClockShortLabel(wc, countryCodes) + " " + entry.time)
+    }
+    return parts.length > 0 ? "  " + parts.join("  ") : ""
+  }
+
   function refresh() {
     displayDate = new Date()
     if (panelLoader.item && panelLoader.item.refresh) panelLoader.item.refresh()
@@ -151,7 +170,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.vertical ? "" : root.displayText
+    text: root.vertical ? "" : (root.displayText + root.worldClockSegment)
     labelVisible: !root.vertical
     hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1

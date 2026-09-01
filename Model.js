@@ -329,6 +329,37 @@ function worldClockDayOffset(hereKey, thereKey) {
   return thereKey < hereKey ? -1 : 1
 }
 
+// Maps an IANA zone name to its primary ISO 3166-1 country code, from
+// tzdata's own zone1970.tab -- e.g. "Asia/Kolkata" -> "IN". First code wins
+// for zones shared by several countries ("GB,GG,IM,JE" -> "GB").
+function parseZoneCountryCodes(text) {
+  var lines = String(text || "").split("\n")
+  var out = {}
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line === "" || line.charAt(0) === "#") continue
+    var cols = line.split("\t")
+    if (cols.length < 3) continue
+    var codes = cols[0].split(",")
+    var tz = cols[2]
+    if (tz && codes[0]) out[tz] = codes[0]
+  }
+  return out
+}
+
+// Short label for a world clock, for contexts too tight for a full city
+// name (the bar pill). A custom label the person actually typed always
+// wins; the auto-assigned fallback (parseWorldClocks defaults an unlabeled
+// entry's label to its raw tz name) is swapped for the zone's country code
+// instead, or a cleaned-up zone-name tail as a last resort.
+function worldClockShortLabel(entry, countryCodes) {
+  if (entry.label && entry.label !== entry.tz) return entry.label
+  var code = countryCodes && countryCodes[entry.tz]
+  if (code) return code
+  var slash = entry.tz.lastIndexOf("/")
+  return slash === -1 ? entry.tz : entry.tz.slice(slash + 1).replace(/_/g, " ")
+}
+
 // Settings round-trip through shell.json as whatever JSON produces; accept
 // either an already-parsed array or (defensively) a JSON string, and drop
 // individual malformed entries rather than failing the whole list.
@@ -379,6 +410,8 @@ if (typeof module !== "undefined") {
     worldClockCommand: worldClockCommand,
     parseWorldClockOutput: parseWorldClockOutput,
     worldClockDayOffset: worldClockDayOffset,
-    parseWorldClocks: parseWorldClocks
+    parseWorldClocks: parseWorldClocks,
+    parseZoneCountryCodes: parseZoneCountryCodes,
+    worldClockShortLabel: worldClockShortLabel
   }
 }

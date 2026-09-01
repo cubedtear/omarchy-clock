@@ -89,6 +89,10 @@ Panel {
   // list-timezones` -- the same source omarchy-menu-timezone reads from --
   // and cached for the rest of the panel's life.
   property var timezoneOptions: []
+  // tzdata's own zone1970.tab, for short country-code labels (BarWidget's
+  // bar-pill segments need these immediately, so this is fetched eagerly
+  // rather than lazily like the searchable timezone list above).
+  property var countryCodes: ({})
 
   // Guarded so the widget renders before the bar is injected (the bar-widget
   // contract instantiates it bare).
@@ -342,7 +346,19 @@ Panel {
     }
   }
 
-  Component.onCompleted: root.refreshWorldClockTimes()
+  Process {
+    id: countryCodeProc
+    command: ["cat", "/usr/share/zoneinfo/zone1970.tab"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.countryCodes = Model.parseZoneCountryCodes(text)
+    }
+  }
+
+  Component.onCompleted: {
+    root.refreshWorldClockTimes()
+    countryCodeProc.running = true
+  }
 
   KeyboardPanel {
     id: panel
@@ -1059,39 +1075,24 @@ Panel {
             }
           }
 
-          // ---- Preferences: just the seconds toggle today, but its own
-          //      labeled section so a later addition has somewhere to go
-          //      that isn't the World Clocks list above.
+          // Seconds toggle. No section header/separator of its own — it
+          // reads as one more low-key control under World Clocks rather
+          // than a whole labeled section.
           Item {
             width: parent.width
-            height: preferencesColumn.implicitHeight
+            height: secondsToggle.implicitHeight
 
-            Column {
-              id: preferencesColumn
+            Toggle {
+              id: secondsToggle
               width: gridColumn.width
               anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(6)
-
-              PanelSeparator {
-                foreground: root.contentForeground
-              }
-
-              PanelSectionHeader {
-                text: "PREFERENCES"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-              }
-
-              Toggle {
-                width: parent.width
-                label: "Show seconds"
-                description: "Adds :ss to the bar label"
-                checked: root.showSeconds
-                foreground: root.contentForeground
-                accent: Color.accent
-                fontFamily: root.contentFontFamily
-                onClicked: root.setShowSeconds(!root.showSeconds)
-              }
+              label: "Show seconds"
+              description: "Adds :ss to the bar label"
+              checked: root.showSeconds
+              foreground: root.contentForeground
+              accent: Color.accent
+              fontFamily: root.contentFontFamily
+              onClicked: root.setShowSeconds(!root.showSeconds)
             }
           }
         }
