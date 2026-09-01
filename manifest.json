@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.aryan-techie.clock",
+  "name": "Better Clock",
+  "version": "0.1.0",
+  "author": "aryan-techie",
+  "license": "MIT",
+  "description": "Date/time pill with an optional seconds display and a calendar popup — month grid with ISO week numbers, year progress, and a configurable world-clock list.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Better Clock",
+    "description": "Date/time pill with seconds toggle, calendar popup, and world clocks",
+    "category": "Time",
+    "allowMultiple": false
+  }
+}
