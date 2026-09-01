@@ -283,44 +283,50 @@ function withSeconds(format, enabled) {
 
 // ---- World clocks. Each entry is { tz, label }; tz is an IANA zone name
 //      (the same identifiers `timedatectl list-timezones` prints, which is
-//      what the add-row's picker is seeded from). Intl does the actual
-//      per-zone math -- QML's plain Date carries no timezone of its own.
-function isValidTimeZone(tz) {
-  try {
-    Intl.DateTimeFormat(undefined, { timeZone: tz })
-    return true
-  } catch (e) {
-    return false
-  }
+//      what the add-row's picker is seeded from).
+//
+// Per-zone time comes from a `date`/TZ subprocess, not Intl: this shell's
+// JS engine accepts Intl.DateTimeFormat's `timeZone` option syntactically
+// but silently fails to resolve real zone names with it (confirmed against
+// "Asia/Tokyo" -- about as canonical an IANA name as exists), so relying on
+// it would make every row read as invalid. `date` reading `TZ` is the same
+// mechanism `timedatectl`/`omarchy-menu-timezone` already depend on, so the
+// underlying tzdata is known-good on this system even though Intl can't
+// reach it from here.
+
+// Builds the argv for a single batched `date` call covering every
+// configured zone at once (one subprocess per tick, not one per row).
+// Zone names travel as real argv entries, never interpolated into a shell
+// string, so there is nothing to escape.
+function worldClockCommand(zones) {
+  var script = 'for tz in "$@"; do printf "%s\\t" "$tz"; TZ="$tz" date "+%H:%M|%Y-%m-%d"; done'
+  return ["bash", "-c", script, "_"].concat(zones)
 }
 
-// Null on a bad zone rather than throwing, so a row with a since-renamed or
-// mistyped identifier degrades to a dash instead of taking the panel down.
-function worldClockTime(date, tz, hour12) {
-  try {
-    return new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: !!hour12
-    }).format(date)
-  } catch (e) {
-    return null
+// Parses that command's stdout ("tz\tHH:MM|YYYY-MM-DD" per line) into
+// { [tz]: { time, dateKey } }. A line for a zone `date` couldn't resolve
+// (renamed/removed from tzdata since it was saved) is skipped, not fatal.
+function parseWorldClockOutput(text) {
+  var lines = String(text || "").split("\n")
+  var out = {}
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line === "") continue
+    var tab = line.indexOf("\t")
+    if (tab === -1) continue
+    var tz = line.slice(0, tab)
+    var rest = line.slice(tab + 1).split("|")
+    if (rest.length !== 2) continue
+    out[tz] = { time: rest[0], dateKey: rest[1] }
   }
+  return out
 }
 
 // -1 / 0 / 1 for yesterday/today/tomorrow *relative to the zone this shell
-// is running in* -- a small flag for rows where the date has already rolled
-// over on one side but not the other.
-function worldClockDayOffset(date, tz) {
-  try {
-    var there = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(date)
-    var here = new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit" }).format(date)
-    if (there === here) return 0
-    return there < here ? -1 : 1
-  } catch (e) {
-    return 0
-  }
+// is running in*, from two already-computed "YYYY-MM-DD" keys.
+function worldClockDayOffset(hereKey, thereKey) {
+  if (!thereKey || thereKey === hereKey) return 0
+  return thereKey < hereKey ? -1 : 1
 }
 
 // Settings round-trip through shell.json as whatever JSON produces; accept
@@ -370,8 +376,8 @@ if (typeof module !== "undefined") {
     nextClockFormat: nextClockFormat,
     isoWeekLiteral: isoWeekLiteral,
     withSeconds: withSeconds,
-    isValidTimeZone: isValidTimeZone,
-    worldClockTime: worldClockTime,
+    worldClockCommand: worldClockCommand,
+    parseWorldClockOutput: parseWorldClockOutput,
     worldClockDayOffset: worldClockDayOffset,
     parseWorldClocks: parseWorldClocks
   }

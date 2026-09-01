@@ -79,6 +79,9 @@ Panel {
   readonly property bool showSeconds: setting("showSeconds", false) === true
   readonly property var worldClocks: Model.parseWorldClocks(setting("worldClocks", []))
   property date worldNow: new Date()
+  // { [tz]: { time: "HH:MM", dateKey: "YYYY-MM-DD" } }, refreshed by
+  // worldClockTimesProc every minute and whenever the list changes.
+  property var worldClockTimes: ({})
   property bool addingWorldClock: false
   property string worldClockError: ""
   property string pendingWorldClockTz: ""
@@ -140,6 +143,7 @@ Panel {
   function refresh() {
     root.today = new Date()
     root.goToToday()
+    root.refreshWorldClockTimes()
   }
 
   function goToToday() {
@@ -240,6 +244,15 @@ Panel {
     if (index < 0 || index >= list.length) return
     list.splice(index, 1)
     persistSettings({ worldClocks: list })
+    root.refreshWorldClockTimes()
+  }
+
+  function refreshWorldClockTimes() {
+    if (root.worldClocks.length === 0) { root.worldClockTimes = {}; return }
+    var zones = []
+    for (var i = 0; i < root.worldClocks.length; i++) zones.push(root.worldClocks[i].tz)
+    worldClockTimesProc.command = Model.worldClockCommand(zones)
+    worldClockTimesProc.running = true
   }
 
   function startAddingWorldClock() {
@@ -261,7 +274,6 @@ Panel {
   function commitWorldClock() {
     var tz = String(root.pendingWorldClockTz || "").replace(/^\s+|\s+$/g, "")
     if (tz === "") { root.worldClockError = "Search and pick a city first"; return }
-    if (!Model.isValidTimeZone(tz)) { root.worldClockError = "Unknown timezone: " + tz; return }
     var label = String(worldClockLabelField.text || "").replace(/^\s+|\s+$/g, "")
     var list = root.worldClocks.slice()
     list.push({ tz: tz, label: label !== "" ? label : tz })
@@ -269,6 +281,7 @@ Panel {
     root.addingWorldClock = false
     root.worldClockError = ""
     root.pendingWorldClockTz = ""
+    root.refreshWorldClockTimes()
   }
 
   // English short day names, matching the rest of the interface.
@@ -293,7 +306,10 @@ Panel {
   SystemClock {
     id: worldClockTicker
     precision: SystemClock.Minutes
-    onDateChanged: root.worldNow = date
+    onDateChanged: {
+      root.worldNow = date
+      root.refreshWorldClockTimes()
+    }
   }
 
   // Same source omarchy-menu-timezone reads from. Run once per panel
@@ -315,6 +331,18 @@ Panel {
       }
     }
   }
+
+  // Batched per-tick lookup for every configured world clock at once (see
+  // Model.worldClockCommand for why this replaces an Intl-based approach).
+  Process {
+    id: worldClockTimesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.worldClockTimes = Model.parseWorldClockOutput(text)
+    }
+  }
+
+  Component.onCompleted: root.refreshWorldClockTimes()
 
   KeyboardPanel {
     id: panel
@@ -871,8 +899,9 @@ Panel {
                   width: worldClocksColumn.width
                   height: Style.space(28)
 
-                  readonly property string timeText: Model.worldClockTime(root.worldNow, modelData.tz, true) || "—"
-                  readonly property int dayOffset: Model.worldClockDayOffset(root.worldNow, modelData.tz)
+                  readonly property var entry: root.worldClockTimes[modelData.tz]
+                  readonly property string timeText: entry ? entry.time : "—"
+                  readonly property int dayOffset: entry ? Model.worldClockDayOffset(root.todayKey, entry.dateKey) : 0
 
                   Text {
                     textFormat: Text.PlainText
